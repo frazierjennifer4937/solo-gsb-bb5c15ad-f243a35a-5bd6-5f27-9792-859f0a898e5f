@@ -748,3 +748,165 @@ def diff_faults(
             raw.append((t, bounds[i + 1], kind, active_base, active_draft))
 
     return _coalesce_diff(raw)
+
+
+# --------------------------------------------------------------------------- #
+# Rule-combination fault daily ledger
+# --------------------------------------------------------------------------- #
+
+
+DAY_SECONDS = 86400.0
+# Upper bound on how many UTC days one ledger query may span (a guard against
+# accidentally enumerating an astronomical range).
+MAX_LEDGER_DAYS = 370
+
+
+def utc_day_start(ts: float) -> float:
+    """Epoch second of the UTC midnight that begins the day containing ``ts``."""
+    return math.floor(ts / DAY_SECONDS) * DAY_SECONDS
+
+
+def utc_date_str(ts: float) -> str:
+    """UTC calendar date ``YYYY-MM-DD`` of an epoch second."""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def split_daily_ledger(
+    intervals: Iterable[tuple[float, float] | Interval],
+    start: float,
+    end: float,
+) -> dict:
+    """Build the per-day fault ledger for one rule combination.
+
+    Inputs are the *saved* fault intervals of the selected rules.  Following
+    the ledger pipeline:
+
+    1. **Merge** — overlapping or touching (``[a,b)`` + ``[b,c)``) fragments
+       are merged as one half-open covering via :func:`union`, so overlapping
+       faults of different rules are timed only once;
+    2. **Clip** — the covering is clipped to the UTC query window
+       ``[start, end)``;
+    3. **Split** — the clipped covering is split at UTC midnight.
+
+    For every UTC day intersected by the query window the result carries:
+
+    * ``fault_seconds``   — covered seconds within the day's *queried* part
+      (deduped, because the covering is merged);
+    * ``new_segments``    — merged segments that **start** within the day's
+      queried part; a cross-day segment counts as new only on the day it
+      begins, and a segment already in progress at the query-window start
+      counts as continued, not new, on the first queried day;
+    * ``continued_segments`` — merged segments that reach into the day from
+      an earlier day (or from before the query window);
+    * ``queried_seconds`` — length of the day's intersection with
+      ``[start, end)``; first/last days therefore use the *actually queried*
+      number of seconds, not a full 86400;
+    * ``coverage_rate``   — ``fault_seconds / queried_seconds`` (``0`` when
+      the day has no queried seconds).
+
+    A segment ending exactly at midnight (``end == midnight``) contributes
+    nothing to the next day — neither coverage nor a continuation — because
+    every interval is half-open ``[start, end)``.
+    """
+    if not math.isfinite(start) or not math.isfinite(end):
+        raise ValueError("ledger bounds must be finite")
+    if end <= start:
+        raise ValueError("ledger query end must be greater than start (half-open [start, end))")
+
+    merged = union(
+        iv if isinstance(iv, Interval) else Interval(float(iv[0]), float(iv[1]))
+        for iv in intervals
+    )
+    # Clip the merged covering to the query window, remembering each merged
+    # segment's *un-clipped* start: a segment entering the window already in
+    # progress is classified continued, not new, on the first queried day.
+    clipped: list[tuple[Interval, float]] = [
+        (Interval(max(iv.start, start), min(iv.end, end)), iv.start)
+        for iv in merged
+        if iv.end > start and iv.start < end
+    ]
+
+    first_day = utc_day_start(start)
+    last_day = utc_day_start(end)
+    if end <= last_day + _EPS:
+        # end sits exactly on UTC midnight: the half-open window excludes that
+        # new day entirely, so it must not appear in the ledger.
+        last_day -= DAY_SECONDS
+    day_count = int(round((last_day - first_day) / DAY_SECONDS)) + 1
+    if day_count > MAX_LEDGER_DAYS:
+        raise ValueError(
+            f"query range spans {day_count} UTC days; at most {MAX_LEDGER_DAYS} are supported"
+        )
+
+    days: list[dict] = []
+    total_fault = 0.0
+    total_new = 0
+    total_cont = 0
+    total_queried = end - start
+    for index in range(day_count):
+        day_start = first_day + index * DAY_SECONDS
+        day_end = day_start + DAY_SECONDS
+        win_s = max(day_start, start)
+        win_e = min(day_end, end)
+        queried = win_e - win_s
+
+        fault_seconds = 0.0
+        new_segments = 0
+        continued_segments = 0
+        segments: list[dict] = []
+        for seg, origin_start in clipped:
+            part_s = max(seg.start, win_s)
+            part_e = min(seg.end, win_e)
+            # Half-open: a segment ending exactly at win_s covers nothing here.
+            if part_e <= part_s:
+                continue
+            # New on this day iff the merged segment begins within the day's
+            # queried part; reaching into the window/day from earlier is always
+            # a continuation.
+            is_new = origin_start >= win_s - _EPS
+            new_segments += 1 if is_new else 0
+            continued_segments += 0 if is_new else 1
+            fault_seconds += part_e - part_s
+            segments.append(
+                {
+                    "start": seg.start,
+                    "end": seg.end,
+                    "day_start": part_s,
+                    "day_end": part_e,
+                    "kind": "new" if is_new else "continued",
+                }
+            )
+
+        total_fault += fault_seconds
+        total_new += new_segments
+        total_cont += continued_segments
+        days.append(
+            {
+                "date": utc_date_str(day_start),
+                "day_start": day_start,
+                "day_end": day_end,
+                "queried_start": win_s,
+                "queried_end": win_e,
+                "queried_seconds": queried,
+                "fault_seconds": fault_seconds,
+                "new_segments": new_segments,
+                "continued_segments": continued_segments,
+                "coverage_rate": fault_seconds / queried if queried > 0 else 0.0,
+                "segments": segments,
+            }
+        )
+
+    return {
+        "start": start,
+        "end": end,
+        "segments": [{"start": s.start, "end": s.end} for s, _ in clipped],
+        "days": days,
+        "totals": {
+            "days": day_count,
+            "fault_seconds": total_fault,
+            "new_segments": total_new,
+            "continued_segments": total_cont,
+            "queried_seconds": total_queried,
+            "coverage_rate": total_fault / total_queried if total_queried > 0 else 0.0,
+        },
+    }

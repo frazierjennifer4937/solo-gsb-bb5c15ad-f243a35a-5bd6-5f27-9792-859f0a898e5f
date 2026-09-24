@@ -100,6 +100,27 @@ class RulePreviewIn(RuleIn):
     rule_id: int | None = None
 
 
+class FaultLedgerIn(BaseModel):
+    """Selected rule group + UTC query range for the read-only fault daily ledger."""
+
+    rule_ids: list[int] = Field(min_length=1)
+    start: Any
+    end: Any
+
+    def bounds(self) -> tuple[float, float]:
+        try:
+            start = to_epoch(self.start)
+            end = to_epoch(self.end)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise HTTPException(
+                status_code=400,
+                detail="ledger end must be greater than start (half-open [start, end), UTC)",
+            )
+        return start, end
+
+
 class AnnotationIn(BaseModel):
     start: Any
     end: Any
@@ -398,6 +419,29 @@ def get_fault_events(start: str | None = None, end: str | None = None) -> list[d
     """Fault events: different rules' faults whose intervals overlap/touch,
     merged transitively. Filtering follows the same [start,end) window."""
     return services.query_fault_events(parse_bound(start), parse_bound(end))
+
+
+@app.post("/api/fault-daily-ledger")
+def fault_daily_ledger(payload: FaultLedgerIn) -> dict:
+    """Rule-combination fault daily ledger (read-only).
+
+    Merges the selected rules' *saved* confirmed fault intervals as one
+    half-open covering (overlaps/touches deduped), clips it to the UTC query
+    window and splits it at UTC midnight.  Per day it returns deduped fault
+    seconds, newly-started segments, segments continued from an earlier day and
+    the coverage rate against the actually-queried seconds of that day.  It
+    never re-evaluates rules.
+    """
+    start, end = payload.bounds()
+    rule_ids = payload.rule_ids
+    if len(rule_ids) > 200:
+        raise HTTPException(status_code=400, detail="at most 200 rules can be selected")
+    try:
+        return services.fault_daily_ledger(rule_ids, start, end)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- #

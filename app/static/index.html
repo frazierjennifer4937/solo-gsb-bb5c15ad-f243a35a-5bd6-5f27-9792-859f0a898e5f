@@ -212,6 +212,37 @@
         <div id="fault-event-list" hidden></div>
       </section>
 
+      <section class="card" id="ledger-card">
+        <div class="card-head">
+          <h2>规则组合故障日账</h2>
+          <span class="muted small">只读 · 采用已保存的已确认故障，规则变更后的重算仍走「评估规则」</span>
+        </div>
+        <div class="muted small maint-hint">
+          选择一组规则与 UTC 查询时间范围：所选规则的故障半开区间先合并（重叠或首尾相接去重），再按 UTC 午夜切分。
+          逐日给出去重故障秒数、<b>新起片段</b>（只在片段起始日计一次）、<b>跨日延续片段</b>与覆盖率；
+          查询首尾落在日中时，覆盖率以当日实际查询秒数为分母；恰在午夜结束的片段不进入次日。
+        </div>
+        <div class="ledger-controls">
+          <div class="ledger-rule-pick">
+            <div class="ledger-rule-head">
+              <span class="small muted">选中规则</span>
+              <span class="ledger-rule-actions">
+                <button id="btn-ledger-all" class="btn btn-small" type="button">全选</button>
+                <button id="btn-ledger-none" class="btn btn-small" type="button">清空</button>
+              </span>
+            </div>
+            <div id="ledger-rules" class="ledger-rules"></div>
+          </div>
+          <div class="ledger-query">
+            <label>UTC 起始 <input type="datetime-local" id="ledger-start" step="1" /></label>
+            <label>UTC 结束 <input type="datetime-local" id="ledger-end" step="1" /></label>
+            <button id="btn-ledger-run" class="btn btn-primary">生成日账</button>
+          </div>
+        </div>
+        <div id="ledger-summary" class="ledger-summary" hidden></div>
+        <div id="ledger-result" class="ledger-result"></div>
+      </section>
+
       <section class="card">
         <div class="card-head"><h2>区间标注</h2><span id="anno-count" class="muted"></span></div>
         <div id="anno-list"></div>

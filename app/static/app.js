@@ -28,6 +28,7 @@ const state = {
   eventLimit: 200,
   eventTotal: 0,
   brush: null,
+  ledger: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -94,6 +95,31 @@ function fromLocalInput(value) {
   if (!value) return null;
   const t = new Date(value).getTime();
   return Number.isNaN(t) ? null : t / 1000;
+}
+
+// datetime-local inputs are parsed in the browser's local zone; the ledger
+// queries in UTC, so build/read them explicitly as UTC (no zone conversion).
+function toUtcInput(epoch) {
+  if (epoch === null || epoch === undefined) return "";
+  const d = new Date(epoch * 1000);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T` +
+    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function fromUtcInput(value) {
+  if (!value) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value.trim());
+  if (!m) return null;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) / 1000;
+}
+
+function fmtDate(epoch) {
+  const d = new Date(epoch * 1000);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+
+function fmtPercent(rate) {
+  return (rate * 100).toFixed(2) + "%";
 }
 
 function ruleColor(ruleId) {
@@ -1339,6 +1365,8 @@ async function reloadAll() {
   renderAnnotations();
   renderMaintenance();
   renderTtls();
+  renderLedgerRules();
+  syncLedgerInputs();
   syncFilterInputs();
   state.eventOffset = 0;
   await loadEvents(false);
@@ -1467,6 +1495,167 @@ async function loadDemo() {
   } catch (e) { toast(e.message, true); }
 }
 
+/* --------------------- rule-combination fault daily ledger --------------------- */
+
+function renderLedgerRules() {
+  const box = $("ledger-rules");
+  if (!state.rules.length) {
+    box.innerHTML = `<div class="empty">尚无规则可选。</div>`;
+    return;
+  }
+  // Preserve the user's previous selection across refreshes (ids that still exist).
+  const selectedIds = new Set(state.ledger?.selectedIds || state.rules.map((r) => r.id));
+  box.innerHTML = state.rules.map((r) => `
+    <label class="ledger-rule-item" title="${esc(r.name)}">
+      <input type="checkbox" data-id="${r.id}" ${selectedIds.has(r.id) ? "checked" : ""} />
+      <span class="swatch" style="background:${ruleColor(r.id)}"></span>
+      <span class="ledger-rule-name">${esc(r.name)}</span>
+    </label>`).join("");
+}
+
+function ledgerSelectedIds() {
+  return [...$("ledger-rules").querySelectorAll('input[type="checkbox"]:checked')].map((c) => Number(c.dataset.id));
+}
+
+function setLedgerRulesChecked(checked) {
+  $("ledger-rules").querySelectorAll('input[type="checkbox"]').forEach((c) => { c.checked = checked; });
+}
+
+function ledgerSegmentsByDay(day) {
+  return day.segments || [];
+}
+
+function renderLedgerResult() {
+  const summaryBox = $("ledger-summary");
+  const box = $("ledger-result");
+  const ledger = state.ledger;
+  if (!ledger || !ledger.result) {
+    summaryBox.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  const { result } = ledger;
+  const t = result.totals;
+  summaryBox.hidden = false;
+  summaryBox.innerHTML = `
+    <div class="ledger-summary-rules">
+      <span class="small muted">选中规则（${result.rules.length}）：</span>
+      ${result.rules.map((r) => `<span class="tag" style="margin:1px 2px"><span class="swatch" style="background:${ruleColor(r.id)};margin-right:4px"></span>${esc(r.name)}</span>`).join("")}
+    </div>
+    <div class="ledger-summary-range small muted">
+      UTC 查询范围：<b>${fmtTime(result.start)} → ${fmtTime(result.end)}</b>（共 ${t.days} 天，查询秒数 ${fmtDur(t.queried_seconds)}）
+    </div>
+    <div class="ledger-totals">
+      <span class="tag" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">去重故障秒数 <b>${fmtDur(t.fault_seconds)}</b></span>
+      <span class="tag" style="background:#ecfdf5;border-color:#a7f3d0;color:#065f46">新起片段 <b>${t.new_segments}</b></span>
+      <span class="tag" style="background:#eff6ff;border-color:#bfdbfe;color:#1e40af">跨日延续 <b>${t.continued_segments}</b></span>
+      <span class="tag" style="background:#faf5ff;border-color:#ddd6fe;color:#5b21b6">总覆盖率 <b>${fmtPercent(t.coverage_rate)}</b></span>
+    </div>`;
+
+  if (!result.days.length) {
+    box.innerHTML = `<div class="empty">查询范围无效。</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <table class="data-table ledger-table">
+      <thead><tr>
+        <th class="lt-date">UTC 日期</th>
+        <th>查询秒数</th>
+        <th>去重故障秒数</th>
+        <th>新起片段</th>
+        <th>跨日延续</th>
+        <th>覆盖率</th>
+        <th class="lt-bar"></th>
+      </tr></thead>
+      <tbody>
+        ${result.days.map((day) => {
+          const partialStart = day.queried_start > day.day_start;
+          const partialEnd = day.queried_end < day.day_end;
+          const partialNote = partialStart || partialEnd
+            ? `title="查询在当日 ${fmtClock(day.queried_start)} → ${fmtClock(day.queried_end)}（${fmtDur(day.queried_seconds)}），覆盖率以此为分母"`
+            : `title="全日 ${fmtDur(day.queried_seconds)} 在查询范围内"`;
+          const segCount = ledgerSegmentsByDay(day).length;
+          return `
+          <tr class="ledger-day ${segCount ? "has-fault" : ""}" data-date="${esc(day.date)}">
+            <td class="lt-date">
+              ${segCount ? `<span class="ledger-chevron">▸</span>` : `<span class="ledger-chevron placeholder"></span>`}
+              ${esc(day.date)}
+              ${partialStart ? '<span class="tag lt-partial">首</span>' : ""}
+              ${partialEnd ? '<span class="tag lt-partial">尾</span>' : ""}
+            </td>
+            <td ${partialNote}>${fmtDur(day.queried_seconds)}${partialStart || partialEnd ? " *" : ""}</td>
+            <td><b>${fmtDur(day.fault_seconds)}</b></td>
+            <td><span class="lt-new">${day.new_segments}</span></td>
+            <td><span class="lt-cont">${day.continued_segments}</span></td>
+            <td>${fmtPercent(day.coverage_rate)}</td>
+            <td class="lt-bar"><div class="coverage-bar"><div class="coverage-fill" style="width:${(day.coverage_rate * 100).toFixed(2)}%"></div></div></td>
+          </tr>
+          <tr class="ledger-seg-row" data-date="${esc(day.date)}" hidden>
+            <td colspan="7">
+              <div class="ledger-seg-list">
+                ${segCount
+                  ? ledgerSegmentsByDay(day).map((s) => `
+                      <span class="ledger-seg ${s.kind === "new" ? "is-new" : "is-cont"}">
+                        <span class="tag ${s.kind === "new" ? "lt-new-tag" : "lt-cont-tag"}">${s.kind === "new" ? "新起" : "延续"}</span>
+                        ${fmtClock(s.day_start)} → ${fmtClock(s.day_end)}
+                        <span class="muted small">（合并片段 ${fmtTime(s.start)} → ${fmtTime(s.end)}，${fmtDur(s.day_end - s.day_start)}）</span>
+                      </span>`).join("")
+                  : `<span class="muted small">当日无故障片段。</span>`}
+              </div>
+            </td>
+          </tr>`;
+        }).join("")}
+      </tbody>
+    </table>
+    <div class="muted small">* 查询首尾落在日中时，覆盖率分母为当日实际查询秒数；半开区间下恰在午夜结束的片段不进入次日。</div>`;
+
+  box.querySelectorAll(".ledger-day.has-fault").forEach((row) => {
+    row.addEventListener("click", () => {
+      const date = row.dataset.date;
+      const segRow = box.querySelector(`.ledger-seg-row[data-date="${date}"]`);
+      const open = segRow.hidden;
+      segRow.hidden = !open;
+      const chev = row.querySelector(".ledger-chevron");
+      if (chev) chev.textContent = open ? "▾" : "▸";
+    });
+  });
+}
+
+async function runLedger() {
+  const ids = ledgerSelectedIds();
+  if (!ids.length) { toast("请至少选择一条规则", true); return; }
+  const start = fromUtcInput($("ledger-start").value);
+  const end = fromUtcInput($("ledger-end").value);
+  if (start === null || end === null || end <= start) {
+    toast("请填写有效的 UTC 起始/结束时间（半开区间）", true);
+    return;
+  }
+  const btn = $("btn-ledger-run");
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = "生成中…";
+  try {
+    const result = await api("/api/fault-daily-ledger", {
+      method: "POST",
+      body: JSON.stringify({ rule_ids: ids, start, end }),
+    });
+    state.ledger = { result, selectedIds: ids };
+    renderLedgerResult();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
+function syncLedgerInputs() {
+  if (state.dataStart !== null && state.dataEnd !== null) {
+    if (!$("ledger-start").value) $("ledger-start").value = toUtcInput(state.dataStart);
+    if (!$("ledger-end").value) $("ledger-end").value = toUtcInput(state.dataEnd);
+  }
+}
+
 /* ------------------------------ init / events ------------------------------ */
 
 function bind() {
@@ -1512,6 +1701,10 @@ function bind() {
 
   $("tab-faults").addEventListener("click", () => switchFaultView("faults"));
   $("tab-events").addEventListener("click", () => switchFaultView("events"));
+
+  $("btn-ledger-run").addEventListener("click", runLedger);
+  $("btn-ledger-all").addEventListener("click", () => setLedgerRulesChecked(true));
+  $("btn-ledger-none").addEventListener("click", () => setLedgerRulesChecked(false));
 
   $("brush-save").addEventListener("click", saveBrush);
   $("brush-cancel").addEventListener("click", () => { $("brush-pop").hidden = true; state.brush = null; });

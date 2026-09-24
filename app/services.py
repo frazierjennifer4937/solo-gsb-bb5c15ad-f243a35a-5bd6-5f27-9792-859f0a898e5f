@@ -16,6 +16,7 @@ from .engine import (
     cluster_intervals,
     diff_faults,
     evaluate_rule,
+    split_daily_ledger,
     to_epoch,
     to_number,
 )
@@ -572,6 +573,64 @@ def query_fault_events(
 ) -> list[dict]:
     """Fault events for the filter window; clustering sees every stored fault."""
     return build_fault_events(query_faults(None, None), start, end)
+
+
+# --------------------------------------------------------------------------- #
+# Rule-combination fault daily ledger (read-only, uses stored fault results)
+# --------------------------------------------------------------------------- #
+
+
+def fault_daily_ledger(rule_ids: list[int], start: float, end: float) -> dict:
+    """Per-day fault ledger for a user-selected group of rules.
+
+    The rules' **saved, already-confirmed** fault intervals are read straight
+    from ``fault_intervals`` — the ledger never re-evaluates rules; recomputing
+    after rule/data changes stays the job of the existing evaluation flow.
+
+    Faults of all selected rules are merged as one half-open covering (overlaps
+    and ``[a,b)`` + ``[b,c)`` touches count once), clipped to the UTC query
+    window and split at UTC midnight (see :func:`split_daily_ledger`).
+    """
+    # De-duplicate ids while keeping their first-seen order.
+    seen: set[int] = set()
+    ordered_ids: list[int] = []
+    for rid in rule_ids:
+        rid = int(rid)
+        if rid not in seen:
+            seen.add(rid)
+            ordered_ids.append(rid)
+
+    rules: list[dict] = []
+    missing: list[int] = []
+    for rid in ordered_ids:
+        rule = db.fetch_rule(rid)
+        if rule is None:
+            missing.append(rid)
+        else:
+            rules.append(rule)
+    if missing:
+        raise KeyError(f"rule not found: {', '.join(str(r) for r in missing)}")
+
+    all_faults = query_faults(None, None)
+    selected = {r["id"] for r in rules}
+    intervals = [
+        Interval(f["start"], f["end"]) for f in all_faults if f["rule_id"] in selected
+    ]
+
+    ledger = split_daily_ledger(intervals, float(start), float(end))
+
+    return {
+        "start": ledger["start"],
+        "end": ledger["end"],
+        "rules": [
+            {"id": r["id"], "name": r["name"], "logic": r["logic"], "duration": r["duration"]}
+            for r in rules
+        ],
+        "segments": ledger["segments"],
+        "days": ledger["days"],
+        "totals": ledger["totals"],
+        "note": "只读视图，直接采用已保存的已确认故障区间；规则或数据变更后的重算仍由现有评估流程负责",
+    }
 
 
 def query_suppressed(
