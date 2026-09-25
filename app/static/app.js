@@ -28,6 +28,8 @@ const state = {
   eventLimit: 200,
   eventTotal: 0,
   brush: null,
+  ledgerSelected: new Set(),
+  ledgerResult: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1219,6 +1221,111 @@ function switchFaultView(view) {
   $("tab-events").classList.toggle("active", view === "events");
 }
 
+/* --------------------- rule-combination fault daily ledger --------------------- */
+
+function fmtPct(ratio) {
+  if (ratio === null || ratio === undefined) return "—";
+  return `${(ratio * 100).toFixed(1)}%`;
+}
+
+function renderLedgerRules() {
+  const box = $("ledger-rules");
+  // keep selections only for rules that still exist
+  const ids = new Set(state.rules.map((r) => r.id));
+  state.ledgerSelected = new Set([...state.ledgerSelected].filter((id) => ids.has(id)));
+  if (!state.rules.length) {
+    box.innerHTML = `<div class="empty">尚无规则。先在左侧创建并评估规则，再回来查询日账。</div>`;
+    return;
+  }
+  box.innerHTML = state.rules.map((r) => `
+    <label class="ledger-rule" data-id="${r.id}">
+      <input type="checkbox" ${state.ledgerSelected.has(r.id) ? "checked" : ""} />
+      <span class="swatch" style="background:${ruleColor(r.id)}"></span>
+      <span class="ledger-rule-name">${esc(r.name)}</span>
+    </label>`).join("");
+  box.querySelectorAll(".ledger-rule").forEach((el) => {
+    const id = Number(el.dataset.id);
+    el.querySelector("input").addEventListener("change", (e) => {
+      if (e.target.checked) state.ledgerSelected.add(id);
+      else state.ledgerSelected.delete(id);
+    });
+  });
+}
+
+function fillLedgerRange() {
+  ensureView();
+  if (typeof state.viewStart === "number" && isFinite(state.viewStart)) {
+    $("ledger-start").value = toLocalInput(state.viewStart);
+  }
+  if (typeof state.viewEnd === "number" && isFinite(state.viewEnd)) {
+    $("ledger-end").value = toLocalInput(state.viewEnd);
+  }
+}
+
+async function runLedger() {
+  const ids = [...state.ledgerSelected];
+  if (!ids.length) { toast("请先勾选至少一条规则", true); return; }
+  const s = fromLocalInput($("ledger-start").value);
+  const e = fromLocalInput($("ledger-end").value);
+  if (s === null || e === null || e <= s) { toast("请填写有效的起始/结束时间（结束须晚于起始）", true); return; }
+  const params = new URLSearchParams({ start: s, end: e });
+  ids.forEach((id) => params.append("rules", id));
+  const btn = $("btn-ledger-query");
+  btn.disabled = true;
+  try {
+    state.ledgerResult = await api(`/api/fault-daily-ledger?${params}`);
+    renderLedger();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderLedger() {
+  const r = state.ledgerResult;
+  const summary = $("ledger-summary");
+  const wrap = $("ledger-table-wrap");
+  if (!r) {
+    summary.hidden = true;
+    wrap.hidden = true;
+    return;
+  }
+  const t = r.totals;
+  summary.hidden = false;
+  summary.innerHTML = `
+    <div class="ledger-line"><b>选中规则（${r.rules.length}）：</b>
+      ${r.rules.map((x) => `<span class="tag">${esc(x.name)}</span>`).join(" ")}</div>
+    <div class="ledger-line"><b>查询范围：</b>${fmtTime(r.start)} → ${fmtTime(r.end)}
+      （共 ${fmtDur(r.end - r.start)}，按 UTC 午夜切分 ${r.days.length} 天）</div>
+    <div class="ledger-line"><b>合并后片段：</b>${t.merged_segments} 段
+      · 去重故障 ${Math.round(t.fault_seconds)} 秒 / 查询 ${Math.round(t.queried_seconds)} 秒
+      · 新起 ${t.new_segments} · 跨日延续 ${t.continuing_segments} · 总覆盖率 ${fmtPct(t.coverage)}</div>`;
+
+  $("ledger-rows").innerHTML = r.days.map((d) => {
+    const pct = fmtPct(d.coverage);
+    return `
+      <tr>
+        <td>${esc(d.date)}</td>
+        <td title="${fmtDur(d.queried_seconds)}">${Math.round(d.queried_seconds)}</td>
+        <td title="${fmtDur(d.fault_seconds)}">${Math.round(d.fault_seconds)}</td>
+        <td>${d.new_segments}</td>
+        <td>${d.continuing_segments}</td>
+        <td><span class="ledger-cov"><span class="ledger-cov-bar" style="width:${(d.coverage * 100).toFixed(1)}%"></span></span> ${pct}</td>
+      </tr>`;
+  }).join("");
+  $("ledger-total").innerHTML = `
+    <tr>
+      <td>合计</td>
+      <td>${Math.round(t.queried_seconds)}</td>
+      <td>${Math.round(t.fault_seconds)}</td>
+      <td>${t.new_segments}</td>
+      <td>${t.continuing_segments}</td>
+      <td>${fmtPct(t.coverage)}</td>
+    </tr>`;
+  wrap.hidden = false;
+}
+
 /* ----------------------------- annotations ----------------------------- */
 
 function renderAnnotations() {
@@ -1339,6 +1446,8 @@ async function reloadAll() {
   renderAnnotations();
   renderMaintenance();
   renderTtls();
+  renderLedgerRules();
+  if (!$("ledger-start").value || !$("ledger-end").value) fillLedgerRange();
   syncFilterInputs();
   state.eventOffset = 0;
   await loadEvents(false);
@@ -1352,6 +1461,7 @@ async function refreshAfterRuleChange() {
   renderRules();
   renderTimeline();
   renderFaultEvents();
+  renderLedgerRules();
 }
 
 function updateStatus() {
@@ -1512,6 +1622,13 @@ function bind() {
 
   $("tab-faults").addEventListener("click", () => switchFaultView("faults"));
   $("tab-events").addEventListener("click", () => switchFaultView("events"));
+
+  $("btn-ledger-query").addEventListener("click", runLedger);
+  $("btn-ledger-clear").addEventListener("click", () => {
+    state.ledgerSelected.clear();
+    renderLedgerRules();
+  });
+  $("btn-ledger-fill").addEventListener("click", fillLedgerRange);
 
   $("brush-save").addEventListener("click", saveBrush);
   $("brush-cancel").addEventListener("click", () => { $("brush-pop").hidden = true; state.brush = null; });

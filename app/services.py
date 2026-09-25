@@ -14,10 +14,12 @@ from .engine import (
     Interval,
     MaintenanceWindow,
     cluster_intervals,
+    daily_fault_ledger,
     diff_faults,
     evaluate_rule,
     to_epoch,
     to_number,
+    union,
 )
 
 DEFAULT_DEVICE_FIELD = "device"
@@ -572,6 +574,78 @@ def query_fault_events(
 ) -> list[dict]:
     """Fault events for the filter window; clustering sees every stored fault."""
     return build_fault_events(query_faults(None, None), start, end)
+
+
+def query_fault_daily_ledger(
+    rule_ids: list[int], start: float, end: float
+) -> dict:
+    """Read-only per-day fault ledger for a combination of selected rules.
+
+    The *already stored* confirmed fault intervals of the given rules are
+    read verbatim (rule changes keep being recomputed by the existing
+    evaluation flow), merged across rules as half-open intervals —
+    overlapping or touching pieces become one — then split at UTC midnights
+    within the half-open query window ``[start, end)``.  See
+    :func:`app.engine.daily_fault_ledger` for the per-day metrics.
+
+    Raises ``ValueError`` on an empty/inverted window and ``KeyError`` for
+    unknown rule ids.
+    """
+    start = float(start)
+    end = float(end)
+    if end <= start:
+        raise ValueError("ledger end must be greater than start")
+    if not rule_ids:
+        raise ValueError("at least one rule is required")
+
+    seen: set[int] = set()
+    unique_ids: list[int] = []
+    for rid in rule_ids:
+        rid = int(rid)
+        if rid not in seen:
+            seen.add(rid)
+            unique_ids.append(rid)
+
+    selected_rules: list[dict] = []
+    missing: list[int] = []
+    for rid in unique_ids:
+        rule = db.fetch_rule(rid)
+        if rule is None:
+            missing.append(rid)
+        else:
+            selected_rules.append(rule)
+    if missing:
+        raise KeyError(f"rule(s) not found: {', '.join(str(i) for i in missing)}")
+
+    faults = [
+        f
+        for f in query_faults(None, None)
+        if f["rule_id"] in seen and f["end"] > start and f["start"] < end
+    ]
+    intervals = [Interval(f["start"], f["end"]) for f in faults]
+    merged = [iv for iv in union(intervals) if iv.end > start and iv.start < end]
+    days = daily_fault_ledger(intervals, start, end)
+
+    total_fault_seconds = sum(d["fault_seconds"] for d in days)
+    total_queried_seconds = sum(d["queried_seconds"] for d in days)
+    return {
+        "start": start,
+        "end": end,
+        "rules": [
+            {"id": r["id"], "name": r["name"], "logic": r["logic"], "duration": r["duration"]}
+            for r in selected_rules
+        ],
+        "merged_segments": [[iv.start, iv.end] for iv in merged],
+        "days": days,
+        "totals": {
+            "fault_seconds": total_fault_seconds,
+            "queried_seconds": total_queried_seconds,
+            "new_segments": sum(d["new_segments"] for d in days),
+            "continuing_segments": sum(d["continuing_segments"] for d in days),
+            "merged_segments": len(merged),
+            "coverage": (total_fault_seconds / total_queried_seconds) if total_queried_seconds else 0.0,
+        },
+    }
 
 
 def query_suppressed(

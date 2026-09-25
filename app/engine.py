@@ -748,3 +748,94 @@ def diff_faults(
             raw.append((t, bounds[i + 1], kind, active_base, active_draft))
 
     return _coalesce_diff(raw)
+
+
+# --------------------------------------------------------------------------- #
+# Per-day fault ledger for a combination of rules
+# --------------------------------------------------------------------------- #
+
+DAY_SECONDS = 86400.0
+
+
+def utc_midnight(t: float) -> float:
+    """Floor an epoch timestamp to the UTC midnight that starts its day.
+
+    POSIX days are exactly 86400 seconds and epoch zero is 1970-01-01T00:00Z,
+    so UTC midnights are integer multiples of ``DAY_SECONDS``.
+    """
+    return math.floor(t / DAY_SECONDS) * DAY_SECONDS
+
+
+def daily_fault_ledger(
+    intervals: Iterable[Interval], start: float, end: float
+) -> list[dict]:
+    """Per-day fault accounting for the half-open query window ``[start, end)``.
+
+    The input intervals (stored confirmed faults of the selected rules) are
+    first merged as half-open intervals: overlapping or merely touching
+    pieces become one segment, so fault time covered by several rules at
+    once is counted only once.  Every merged segment is then split at UTC
+    midnights and accounted per day:
+
+    * ``fault_seconds`` — total merged (deduplicated) fault time in the day,
+      clipped both to the day and to the query window;
+    * ``new_segments`` — segments whose start instant lies inside this UTC
+      day (a cross-day segment is "new" on its start day only);
+    * ``continuing_segments`` — segments that started on an earlier UTC day
+      and continue into this one across midnight;
+    * ``queried_seconds`` — length of the day actually covered by the query:
+      86400 for whole days, clipped at the first/last day when the query
+      bounds fall mid-day; ``coverage`` is fault_seconds / queried_seconds.
+
+    A segment ending exactly at a midnight is half-open, so it produces no
+    piece on the next day (no continuing segment there).  Every UTC day
+    touched by the query appears in the result, including days without any
+    fault time (zeros, coverage 0).
+    """
+    start = float(start)
+    end = float(end)
+    if end <= start:
+        raise ValueError("ledger end must be greater than start")
+
+    merged = union(intervals)
+    days: list[dict] = []
+    day0 = utc_midnight(start)
+    while day0 < end:
+        day1 = day0 + DAY_SECONDS
+        win0 = max(day0, start)
+        win1 = min(day1, end)
+        queried_seconds = win1 - win0
+
+        fault_seconds = 0.0
+        new_segments = 0
+        continuing_segments = 0
+        for iv in merged:
+            seg0 = max(iv.start, win0)
+            seg1 = min(iv.end, win1)
+            if seg1 > seg0:
+                fault_seconds += seg1 - seg0
+                if iv.start >= day0:
+                    # The segment starts inside this UTC day (a segment that
+                    # began earlier on the same calendar day but before the
+                    # query bound still has this day as its start day).
+                    new_segments += 1
+                else:
+                    # It started on an earlier UTC day and crosses midnight.
+                    continuing_segments += 1
+
+        days.append(
+            {
+                "date": datetime.fromtimestamp(day0, tz=timezone.utc).strftime("%Y-%m-%d"),
+                "day_start": day0,
+                "day_end": day1,
+                "queried_start": win0,
+                "queried_end": win1,
+                "queried_seconds": queried_seconds,
+                "fault_seconds": fault_seconds,
+                "new_segments": new_segments,
+                "continuing_segments": continuing_segments,
+                "coverage": fault_seconds / queried_seconds,
+            }
+        )
+        day0 = day1
+    return days

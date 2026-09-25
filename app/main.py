@@ -400,6 +400,34 @@ def get_fault_events(start: str | None = None, end: str | None = None) -> list[d
     return services.query_fault_events(parse_bound(start), parse_bound(end))
 
 
+@app.get("/api/fault-daily-ledger")
+def get_fault_daily_ledger(
+    rules: list[int] = Query(..., min_length=1),
+    start: str = Query(...),
+    end: str = Query(...),
+) -> dict:
+    """Read-only per-day fault ledger for a combination of selected rules.
+
+    Reads the stored confirmed fault intervals of the given rules (no
+    re-evaluation — rule changes keep being recomputed by the existing
+    flow), merges overlapping/touching half-open pieces across rules, then
+    splits the fault time at UTC midnights inside [start, end).  Each day
+    reports deduplicated fault seconds, newly started segments, segments
+    continuing from previous days, and the coverage against the day's
+    actually queried seconds.
+    """
+    start_ts = parse_bound(start)
+    end_ts = parse_bound(end)
+    if start_ts is None or end_ts is None:
+        raise HTTPException(status_code=400, detail="start and end are required")
+    try:
+        return services.query_fault_daily_ledger(rules, start_ts, end_ts)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # --------------------------------------------------------------------------- #
 # Annotations
 # --------------------------------------------------------------------------- #

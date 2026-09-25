@@ -213,6 +213,46 @@
       </section>
 
       <section class="card">
+        <div class="card-head">
+          <h2>规则组合故障日账</h2>
+          <span class="muted small">只读 · 沿用已确认故障，不触发重算</span>
+        </div>
+        <div class="muted small ledger-hint">
+          选择一组规则与 UTC 查询时间范围：读取这些规则<b>已保存的故障区间</b>，先按半开区间合并重叠或相接片段（多规则同时故障只计一次），
+          再按 <b>UTC 午夜</b>切分逐日统计去重故障秒数、新起片段数、跨日延续片段数与覆盖率。跨日片段只在起始日计「新起」，后续日计「延续」；
+          查询首尾落在日中时以当日实际查询秒数为覆盖率分母，恰在午夜结束的片段不进入次日。
+        </div>
+        <div class="ledger-controls">
+          <div class="ledger-rules" id="ledger-rules"></div>
+          <div class="ledger-form">
+            <label class="ledger-field">起始（本机时区） <input type="datetime-local" id="ledger-start" step="1" /></label>
+            <label class="ledger-field">结束（本机时区） <input type="datetime-local" id="ledger-end" step="1" /></label>
+            <button id="btn-ledger-query" class="btn btn-small btn-primary">查询日账</button>
+            <button id="btn-ledger-clear" class="btn btn-small">清除选择</button>
+            <button id="btn-ledger-fill" class="btn btn-small">填入当前筛选范围</button>
+          </div>
+          <div class="muted small">时间在本机时区输入、按 UTC 查询，并以 <b>UTC 午夜（00:00 UTC）</b>切分逐日。</div>
+        </div>
+        <div id="ledger-summary" class="ledger-summary" hidden></div>
+        <div id="ledger-table-wrap" class="ledger-table-wrap" hidden>
+          <table class="data-table ledger-table">
+            <thead>
+              <tr>
+                <th>UTC 日期</th>
+                <th>当日查询秒数</th>
+                <th>去重故障秒数</th>
+                <th>新起片段</th>
+                <th>跨日延续</th>
+                <th>覆盖率</th>
+              </tr>
+            </thead>
+            <tbody id="ledger-rows"></tbody>
+            <tfoot id="ledger-total"></tfoot>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
         <div class="card-head"><h2>区间标注</h2><span id="anno-count" class="muted"></span></div>
         <div id="anno-list"></div>
       </section>
